@@ -1,278 +1,314 @@
-# connectai_core.py
-import requests
-import json
-import time
-import re
-from collections import defaultdict
+"""Core logic for Kimiko, an AI-powered desktop companion.
+
+This module contains:
+- persistent short/long-term memory
+- mode-aware conversation state
+- response generation against a local OpenAI-compatible endpoint
+- optional command helpers for memory inspection and maintenance
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+import json
 import os
+import re
+import time
+from typing import Dict, List
 
-# === CONFIG ===
-API_URL = "http://localhost:1234/v1/chat/completions"
-HEADERS = {"Content-Type": "application/json"}
-MODEL_NAME = "MythoMax-L2-Kimiko-v2-13B"
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
-SAVE_FILE = "connectai_memory.json"
-SHORT_TERM_LIFETIME = 420           # seconds to keep short-term logs
-PROMOTION_THRESHOLD = 4             # mentions required to promote a keyword
-SIMILARITY_THRESHOLD = 0.78         # token similarity threshold
 
-# === MEMORY ===
-memory = {"log": [], "perma": []}
-word_counts = defaultdict(int)
+@dataclass(frozen=True)
+class KimikoConfig:
+    api_url: str = "http://localhost:1234/v1/chat/completions"
+    model_name: str = "MythoMax-L2-Kimiko-v2-13B"
+    save_file: str = "connectai_memory.json"
+    short_term_lifetime: int = 420
+    promotion_threshold: int = 4
+    similarity_threshold: float = 0.78
+    temperature: float = 0.8
+    max_tokens: int = 400
+    max_history_window: int = 20
 
-# === ROLE CONTEXTS ===
-ROLE_CONTEXTS = {
+
+ROLE_CONTEXTS: Dict[str, str] = {
     "work": (
-        "You are ConnectAI in Work Mode. "
-        "You act as a productivity and focus assistant for users working long hours. "
-        "Be encouraging, professional, and concise. "
-        "Help the user plan tasks, suggest short breaks, and keep them motivated."
+        "You are Kimiko in Work Mode. "
+        "You are a productivity and focus companion. "
+        "Be encouraging, direct, and concise. "
+        "Help the user plan, prioritize, and rest sustainably."
     ),
     "therapy": (
-        "You are ConnectAI in Therapy Mode. "
-        "You are a compassionate listener and reflective guide. "
-        "Encourage emotional expression, mindfulness, and self-awareness. "
-        "Do not provide clinical therapy — instead, be supportive, empathetic, and understanding."
+        "You are Kimiko in Reflection Mode. "
+        "You are supportive, empathetic, and non-judgmental. "
+        "Encourage emotional expression and grounding. "
+        "Do not provide clinical therapy or diagnoses."
     ),
     "companion": (
-        "You are ConnectAI in Companion Mode. "
-        "You are a friendly digital companion who chats casually, provides company, "
-        "and helps the user feel less lonely. Be warm, lighthearted, and positive."
+        "You are Kimiko in Companion Mode. "
+        "You are warm, playful, and emotionally present. "
+        "Chat naturally and keep a gentle, friendly tone."
+    ),
+}
+
+
+@dataclass
+class KimikoCore:
+    config: KimikoConfig = field(default_factory=KimikoConfig)
+    role_contexts: Dict[str, str] = field(default_factory=lambda: dict(ROLE_CONTEXTS))
+
+    memory: Dict[str, List[Dict[str, float]]] = field(
+        default_factory=lambda: {"log": [], "perma": []}
     )
-}
+    word_counts: Counter = field(default_factory=Counter)
+    current_mode: str = "companion"
+    conversations: Dict[str, List[Dict[str, str]]] = field(init=False)
 
-# === Separate conversation histories per mode ===
-conversations = {
-    "work": [{"role": "system", "content": ROLE_CONTEXTS["work"]}],
-    "therapy": [{"role": "system", "content": ROLE_CONTEXTS["therapy"]}],
-    "companion": [{"role": "system", "content": ROLE_CONTEXTS["companion"]}],
-}
+    def __post_init__(self) -> None:
+        self.conversations = {
+            mode: [{"role": "system", "content": prompt}]
+            for mode, prompt in self.role_contexts.items()
+        }
+        self.setup_memory()
 
-current_mode = "companion"  # default starting mode
+    # ---------- persistence ----------
+    def setup_memory(self) -> None:
+        if os.path.exists(self.config.save_file) and os.path.getsize(self.config.save_file) > 0:
+            try:
+                with open(self.config.save_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                self.memory = {
+                    "log": payload.get("log", []),
+                    "perma": payload.get("perma", []),
+                }
+            except (json.JSONDecodeError, OSError, TypeError):
+                self.memory = {"log": [], "perma": []}
+                self.save_memory()
+        else:
+            self.memory = {"log": [], "perma": []}
+            self.save_memory()
 
-
-# === Memory setup ===
-def setup_memory():
-    global memory
-    if os.path.exists(SAVE_FILE) and os.path.getsize(SAVE_FILE) > 0:
+    def save_memory(self) -> None:
         try:
-            with open(SAVE_FILE, "r", encoding="utf-8") as f:
-                memory = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            memory = {"log": [], "perma": []}
-            save_memory()
-    else:
-        memory = {"log": [], "perma": []}
-        save_memory()
+            with open(self.config.save_file, "w", encoding="utf-8") as f:
+                json.dump(self.memory, f, indent=2, ensure_ascii=False)
+        except OSError:
+            return
 
+    # ---------- memory helpers ----------
+    @staticmethod
+    def normalize(text: str) -> List[str]:
+        return re.findall(r"\b\w+\b", text.lower())
 
-def save_memory():
-    try:
-        with open(SAVE_FILE, "w", encoding="utf-8") as f:
-            json.dump(memory, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass
+    def similar(self, a: str, b: str) -> bool:
+        return SequenceMatcher(None, a, b).ratio() >= self.config.similarity_threshold
 
+    def related_to(self, word: str, text: str) -> bool:
+        return any(token == word or self.similar(token, word) for token in self.normalize(text))
 
-# === Memory helpers ===
-def cleanup_memory():
-    now = time.time()
-    memory["log"] = [m for m in memory["log"] if now - m["timestamp"] < SHORT_TERM_LIFETIME]
+    def cleanup_memory(self) -> None:
+        now = time.time()
+        self.memory["log"] = [
+            entry
+            for entry in self.memory["log"]
+            if now - float(entry.get("timestamp", now)) < self.config.short_term_lifetime
+        ]
 
+    def promote_to_perma(self, keyword: str) -> None:
+        for entry in self.memory["log"]:
+            if self.related_to(keyword, str(entry.get("text", ""))) and entry not in self.memory["perma"]:
+                self.memory["perma"].append(entry)
+        self.save_memory()
 
-def normalize(text):
-    return re.findall(r"\b\w+\b", text.lower())
+    def add_memory(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        self.memory["log"].append({"text": text, "timestamp": time.time()})
+        self.save_memory()
 
+    def recall_context(self, max_recent: int = 5, max_perma: int = 10) -> str:
+        self.cleanup_memory()
+        recent = [str(m.get("text", "")) for m in self.memory["log"][-max_recent:]]
+        perma = [str(m.get("text", "")) for m in self.memory["perma"][-max_perma:]]
+        combined = [x for x in perma + recent if x]
+        return "\n".join(combined) if combined else "(no recent memories)"
 
-def similar(a, b):
-    return SequenceMatcher(None, a, b).ratio() >= SIMILARITY_THRESHOLD
+    # ---------- mode/state ----------
+    def set_mode(self, mode_name: str) -> None:
+        normalized = mode_name.lower().strip()
+        if normalized not in self.conversations:
+            raise ValueError(f"Invalid mode '{mode_name}'. Must be one of: {list(self.conversations.keys())}")
+        self.current_mode = normalized
 
+    def get_current_mode(self) -> str:
+        return self.current_mode
 
-def related_to(word, text):
-    for token in normalize(text):
-        if token == word or similar(token, word):
-            return True
-    return False
+    def reset_conversation(self, mode: str | None = None) -> None:
+        mode = (mode or self.current_mode).lower()
+        if mode not in self.role_contexts:
+            raise ValueError(f"Unknown mode '{mode}'.")
+        self.conversations[mode] = [{"role": "system", "content": self.role_contexts[mode]}]
 
+    # ---------- generation ----------
+    def _build_payload(self, user_input: str) -> Dict[str, object]:
+        mode = self.current_mode
+        convo = self.conversations[mode]
 
-def promote_to_perma(keyword):
-    for entry in memory["log"]:
-        if related_to(keyword, entry["text"]) and entry not in memory["perma"]:
-            memory["perma"].append(entry)
-    save_memory()
+        self.add_memory(user_input)
+        for word in self.normalize(user_input):
+            self.word_counts[word] += 1
+            if self.word_counts[word] >= self.config.promotion_threshold:
+                self.promote_to_perma(word)
 
+        memory_context = self.recall_context()
+        convo.append({"role": "system", "content": f"Memory context:\n{memory_context}"})
+        convo.append({"role": "user", "content": user_input})
 
-def add_memory(text):
-    if not text or not text.strip():
-        return
-    memory["log"].append({"text": text.strip(), "timestamp": time.time()})
-    save_memory()
+        return {
+            "model": self.config.model_name,
+            "messages": convo[-self.config.max_history_window :],
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
 
+    def send(self, user_input: str, timeout: int = 60) -> str:
+        payload = self._build_payload(user_input)
+        convo = self.conversations[self.current_mode]
 
-def recall_context(max_recent=5, max_perma=10):
-    cleanup_memory()
-    recent = [m["text"] for m in memory["log"][-max_recent:]]
-    perma = [m["text"] for m in memory["perma"][-max_perma:]]
-    combined = perma + recent
-    return "\n".join(combined) if combined else "(no recent memories)"
-
-
-# === Mode Management ===
-def set_mode(mode_name: str):
-    """
-    Switch the active conversation mode (work, therapy, companion).
-    Keeps that mode's conversation isolated.
-    """
-    global current_mode
-    mode_name = mode_name.lower()
-    if mode_name not in conversations:
-        raise ValueError(f"Invalid mode '{mode_name}'. Must be one of: {list(conversations.keys())}")
-    current_mode = mode_name
-    print(f"[INFO] Mode changed to '{mode_name}'.")
-
-
-def get_current_mode():
-    return current_mode
-
-
-def reset_conversation(mode=None):
-    """Reset one mode's chat history."""
-    if mode is None:
-        mode = current_mode
-    conversations[mode] = [{"role": "system", "content": ROLE_CONTEXTS[mode]}]
-    print(f"[INFO] Conversation reset for {mode} mode.")
-
-
-# === Core: send_to_connectai ===
-def send_to_connectai(user_input, timeout=60):
-    """
-    Send user_input to the local LLM endpoint for the current mode.
-    Each mode has its own isolated chat history.
-    """
-    global word_counts
-    mode = current_mode
-    convo = conversations[mode]
-
-    add_memory(user_input)
-    for word in normalize(user_input):
-        word_counts[word] += 1
-        if word_counts[word] >= PROMOTION_THRESHOLD:
-            promote_to_perma(word)
-
-    mem_context = recall_context()
-    convo.append({"role": "system", "content": f"Memory context:\n{mem_context}"})
-    convo.append({"role": "user", "content": user_input})
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": convo[-20:],
-        "temperature": 0.8,
-        "max_tokens": 400
-    }
-
-    reply = ""
-    try:
-        res = requests.post(API_URL, headers=HEADERS, json=payload, timeout=timeout)
-        res.raise_for_status()
-        j = res.json()
-        if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
-            choice = j["choices"][0]
-            reply = (
-                choice.get("message", {}).get("content", "") or
-                choice.get("text", "") or
-                j.get("response", "") or
-                j.get("assistant", "")
+        reply = ""
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            req = urlrequest.Request(
+                self.config.api_url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-    except Exception as e:
-        reply = f"(Error contacting model: {e})"
+            with urlrequest.urlopen(req, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if isinstance(data.get("choices"), list) and data["choices"]:
+                choice = data["choices"][0]
+                reply = (
+                    choice.get("message", {}).get("content", "")
+                    or choice.get("text", "")
+                    or data.get("response", "")
+                    or data.get("assistant", "")
+                )
+        except (urlerror.URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as exc:
+            reply = f"(Error contacting model: {exc})"
 
-    convo.append({"role": "assistant", "content": reply})
-    save_memory()
-    return reply
+        convo.append({"role": "assistant", "content": reply})
+        self.save_memory()
+        return reply
+
+    # ---------- command processing ----------
+    def handle_command(self, cmd: str) -> str | None:
+        parts = cmd.split(maxsplit=1)
+        if not parts:
+            return None
+
+        action = parts[0].lower()
+
+        if action == "/show":
+            if len(parts) < 2:
+                return "⚠️ Usage: /show perma | /show log"
+            target = parts[1].strip().lower()
+            if target == "perma":
+                if not self.memory["perma"]:
+                    return "No permanent memories."
+                lines = [f"{i}. {m['text']}" for i, m in enumerate(self.memory["perma"], 1)]
+                return "\n".join(lines)
+            if target == "log":
+                if not self.memory["log"]:
+                    return "No short-term logs."
+                lines = [f"{i}. {m['text']}" for i, m in enumerate(self.memory["log"], 1)]
+                return "\n".join(lines)
+            return "⚠️ Unknown target for /show"
+
+        if action == "/forget":
+            if len(parts) < 2:
+                return "⚠️ Usage: /forget <word>"
+            word = parts[1].strip().lower()
+            before = len(self.memory["perma"])
+            self.memory["perma"] = [m for m in self.memory["perma"] if not self.related_to(word, str(m.get("text", "")))]
+            self.save_memory()
+            return f"Forgot {before - len(self.memory['perma'])} perma entries related to '{word}'."
+
+        if action == "/clear":
+            if len(parts) < 2:
+                return "⚠️ Usage: /clear perma | /clear all"
+            target = parts[1].strip().lower()
+            if target == "perma":
+                self.memory["perma"].clear()
+                self.save_memory()
+                return "Cleared permanent memory."
+            if target == "all":
+                self.memory["perma"].clear()
+                self.memory["log"].clear()
+                self.save_memory()
+                return "Cleared all memory."
+            return "⚠️ Unknown target for /clear"
+
+        if action == "/mode":
+            if len(parts) < 2:
+                return f"Current mode: {self.current_mode}"
+            self.set_mode(parts[1].strip())
+            return f"Mode changed to '{self.current_mode}'."
+
+        if action == "/reset":
+            self.reset_conversation()
+            return f"Conversation reset for {self.current_mode} mode."
+
+        return None
 
 
-# === Command handler (optional, same as before) ===
-def handle_command(cmd):
-    parts = cmd.split(maxsplit=1)
-    if not parts:
+# Backwards-compatible shared instance API for existing integrations.
+_core = KimikoCore()
+
+
+def send_to_connectai(user_input: str, timeout: int = 60) -> str:
+    return _core.send(user_input, timeout=timeout)
+
+
+def set_mode(mode_name: str) -> None:
+    _core.set_mode(mode_name)
+
+
+def get_current_mode() -> str:
+    return _core.get_current_mode()
+
+
+def reset_conversation(mode: str | None = None) -> None:
+    _core.reset_conversation(mode)
+
+
+def handle_command(cmd: str) -> bool:
+    response = _core.handle_command(cmd)
+    if response is None:
         return False
-    action = parts[0].lower()
-
-    if action == "/show":
-        if len(parts) < 2:
-            print("⚠️ Usage: /show perma | /show log")
-            return True
-        target = parts[1].strip().lower()
-        if target == "perma":
-            if not memory["perma"]:
-                print("No permanent memories.")
-            else:
-                for i, m in enumerate(memory["perma"], 1):
-                    print(f"{i}. {m['text']}")
-        elif target == "log":
-            if not memory["log"]:
-                print("No short-term logs.")
-            else:
-                for i, m in enumerate(memory["log"], 1):
-                    print(f"{i}. {m['text']}")
-        else:
-            print("⚠️ Unknown target for /show")
-        return True
-
-    if action == "/forget":
-        if len(parts) < 2:
-            print("⚠️ Usage: /forget <word>")
-            return True
-        word = parts[1].lower()
-        before = len(memory["perma"])
-        memory["perma"] = [m for m in memory["perma"] if not related_to(word, m["text"])]
-        save_memory()
-        print(f"Forgot {before - len(memory['perma'])} perma entries related to '{word}'.")
-        return True
-
-    if action == "/clear":
-        if len(parts) < 2:
-            print("⚠️ Usage: /clear perma | /clear all")
-            return True
-        target = parts[1].strip().lower()
-        if target == "perma":
-            memory["perma"].clear()
-            save_memory()
-            print("Cleared permanent memory.")
-        elif target == "all":
-            memory["perma"].clear()
-            memory["log"].clear()
-            save_memory()
-            print("Cleared all memory.")
-        else:
-            print("⚠️ Unknown target for /clear")
-        return True
-
-    return False
+    print(response)
+    return True
 
 
-# === Demo ===
 if __name__ == "__main__":
-    setup_memory()
-    print("ConnectAI Multi-Mode Demo (work / therapy / companion)")
+    print("Kimiko Core CLI (work / therapy / companion)")
     print("Type '/mode work' to switch, '/reset' to clear, or 'exit' to quit.\n")
 
     while True:
-        user_input = input(f"({current_mode}) You: ").strip()
+        user_input = input(f"({get_current_mode()}) You: ").strip()
         if not user_input:
             continue
         if user_input.lower() == "exit":
             break
-        if user_input.startswith("/mode"):
-            _, mode = user_input.split(maxsplit=1)
-            set_mode(mode)
-            continue
-        if user_input == "/reset":
-            reset_conversation()
-            continue
-        if handle_command(user_input):
+
+        command_result = _core.handle_command(user_input)
+        if command_result is not None:
+            print(command_result)
             continue
 
-        reply = send_to_connectai(user_input)
-        print(f"({current_mode}) ConnectAI:", reply)
+        print(f"({get_current_mode()}) Kimiko: {_core.send(user_input)}")
