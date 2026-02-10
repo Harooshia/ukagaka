@@ -95,8 +95,13 @@ class KimikoDesktopGhost:
         self.root.after(1000, self._idle_tick)
 
     # ---------------- image loading & rendering ----------------
-    def _chroma_key_green(self, img):
-        """Remove green-screen pixels and reduce green fringe on semi-transparent edges."""
+    def _prepare_image_for_colorkey_window(self, img):
+        """Normalize alpha for colorkey transparency windows.
+
+        Tk's transparentcolor behaves as color-key transparency (not full per-pixel alpha),
+        so semi-transparent edges can blend with the green key color and look like green halos.
+        We harden near-transparent pixels and clamp edge alpha to remove visible green fringes.
+        """
         if Image is None:
             return img
 
@@ -108,15 +113,23 @@ class KimikoDesktopGhost:
             for x in range(width):
                 r, g, b, a = px[x, y]
 
-                # Hard-key very green pixels fully transparent.
-                if g > 115 and g > r * 1.22 and g > b * 1.22:
+                # Remove extremely transparent pixels entirely.
+                if a <= 24:
                     px[x, y] = (r, g, b, 0)
                     continue
 
-                # De-spill green from anti-aliased edge pixels so no green halo remains.
-                if a < 255 and g > r and g > b:
-                    g2 = int((r + b) / 2)
-                    px[x, y] = (r, g2, b, a)
+                # Avoid half-transparent edge blending against green transparentcolor key.
+                if a < 220:
+                    # Edge color de-spill: neutralize green-heavy edge pixels first.
+                    if g > r and g > b:
+                        g = int((r + b) / 2)
+                    px[x, y] = (r, g, b, 0)
+                    continue
+
+                # Keep interior opaque, but de-spill any green tint.
+                if g > r * 1.1 and g > b * 1.1:
+                    g = int((r + b) / 2)
+                px[x, y] = (r, g, b, 255)
 
         return rgba
 
@@ -139,7 +152,7 @@ class KimikoDesktopGhost:
         if Image is not None and ImageTk is not None:
             try:
                 pil_img = Image.open(path)
-                pil_img = self._chroma_key_green(pil_img)
+                pil_img = self._prepare_image_for_colorkey_window(pil_img)
                 pil_img = self._fit_image(pil_img)
                 return ImageTk.PhotoImage(pil_img)
             except Exception:
