@@ -264,26 +264,40 @@ class KimikoDesktopGhost:
 
         container = tk.Frame(self.bubble, bg="#ebe7ff", bd=2, relief="solid", highlightbackground="#9f96e4")
         container.pack(fill="both", expand=True)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(0, weight=1)
 
-        self.dialog_label = tk.Label(
-            container,
-            text="Hi! Right-click me for options.",
-            justify="left",
-            anchor="w",
-            wraplength=290,
-            bg="#ebe7ff",
+        msg_frame = tk.Frame(container, bg="#ebe7ff")
+        msg_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+        msg_frame.grid_columnconfigure(0, weight=1)
+        msg_frame.grid_rowconfigure(0, weight=1)
+
+        self.dialog_text = tk.Text(
+            msg_frame,
+            wrap="word",
+            bg="#f4f1ff",
             fg="#2f2a56",
+            relief="flat",
+            bd=0,
             font=("Segoe UI", 10),
+            height=8,
             padx=10,
             pady=8,
+            insertbackground="#2f2a56",
         )
-        self.dialog_label.pack(fill="x")
+        self.dialog_text.grid(row=0, column=0, sticky="nsew")
+
+        scroll = tk.Scrollbar(msg_frame, orient="vertical", command=self.dialog_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.dialog_text.configure(yscrollcommand=scroll.set)
+        self.dialog_text.insert("1.0", "Hi! Right-click me for options.")
+        self.dialog_text.configure(state="disabled")
 
         input_row = tk.Frame(container, bg="#ebe7ff")
-        input_row.pack(fill="x", padx=8, pady=(0, 8))
+        input_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         self.entry = tk.Entry(input_row, font=("Segoe UI", 10), relief="solid", bd=1)
-        self.entry.pack(side="left", fill="x", expand=True, ipady=4)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=5)
         self.entry.bind("<Return>", self.on_submit)
 
         self.send_btn = tk.Button(
@@ -296,6 +310,13 @@ class KimikoDesktopGhost:
             padx=10,
         )
         self.send_btn.pack(side="left", padx=(6, 0))
+
+    def _set_dialog_text(self, message: str) -> None:
+        self.dialog_text.configure(state="normal")
+        self.dialog_text.delete("1.0", "end")
+        self.dialog_text.insert("1.0", message)
+        self.dialog_text.see("end")
+        self.dialog_text.configure(state="disabled")
 
     # ---------------- state helpers ----------------
     def _register_activity(self) -> None:
@@ -317,12 +338,12 @@ class KimikoDesktopGhost:
     def _set_mode(self, mode: str) -> None:
         self._register_activity()
         self.core.set_mode(mode)
-        self.dialog_label.config(text=f"Mode changed to {mode}.")
+        self._set_dialog_text(f"Mode changed to {mode}.")
 
     def _reset_conversation(self) -> None:
         self._register_activity()
         self.core.reset_conversation()
-        self.dialog_label.config(text="Conversation reset.")
+        self._set_dialog_text("Conversation reset.")
 
     # ---------------- drawing & animation ----------------
     def _draw_character(self) -> None:
@@ -365,8 +386,8 @@ class KimikoDesktopGhost:
         self.is_talking = False
 
     def bubble_position(self) -> str:
-        bubble_w = 320
-        bubble_h = 180
+        bubble_w = 360
+        bubble_h = 240
         x = self.current_x - bubble_w - 12
         y = self.y + 8
         if x < 8:
@@ -469,12 +490,12 @@ class KimikoDesktopGhost:
 
         command_result = self.core.handle_command(text)
         if command_result is not None:
-            self.dialog_label.config(text=command_result)
+            self._set_dialog_text(command_result)
             self._start_talking()
             self.root.after(700, self._stop_talking)
             return
 
-        self.dialog_label.config(text="Kimiko is thinking...")
+        self._set_dialog_text("Kimiko is thinking...")
         self._start_talking()
         threading.Thread(target=self._get_reply, args=(text,), daemon=True).start()
 
@@ -484,7 +505,7 @@ class KimikoDesktopGhost:
 
     def _poll_queue(self) -> None:
         while not self.response_queue.empty():
-            self.dialog_label.config(text=self.response_queue.get())
+            self._set_dialog_text(self.response_queue.get())
             self.root.after(900, self._stop_talking)
 
         if self.is_bubble_open:
