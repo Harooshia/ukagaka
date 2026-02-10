@@ -96,18 +96,28 @@ class KimikoDesktopGhost:
 
     # ---------------- image loading & rendering ----------------
     def _chroma_key_green(self, img):
-        """Remove green-screen-like pixels by setting alpha to transparent."""
+        """Remove green-screen pixels and reduce green fringe on semi-transparent edges."""
         if Image is None:
             return img
 
         rgba = img.convert("RGBA")
-        out = []
-        for r, g, b, a in rgba.getdata():
-            if g > 120 and g > r * 1.25 and g > b * 1.25:
-                out.append((r, g, b, 0))
-            else:
-                out.append((r, g, b, a))
-        rgba.putdata(out)
+        px = rgba.load()
+        width, height = rgba.size
+
+        for y in range(height):
+            for x in range(width):
+                r, g, b, a = px[x, y]
+
+                # Hard-key very green pixels fully transparent.
+                if g > 115 and g > r * 1.22 and g > b * 1.22:
+                    px[x, y] = (r, g, b, 0)
+                    continue
+
+                # De-spill green from anti-aliased edge pixels so no green halo remains.
+                if a < 255 and g > r and g > b:
+                    g2 = int((r + b) / 2)
+                    px[x, y] = (r, g2, b, a)
+
         return rgba
 
     def _fit_image(self, img):
