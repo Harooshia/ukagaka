@@ -33,7 +33,9 @@ class KimikoDesktopGhost:
         self.root.title("Kimiko")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#101018")
+        self.key_color = "#ff00ff"
+        self.root.configure(bg=self.key_color)
+        self.root.wm_attributes("-transparentcolor", self.key_color)
 
         self.width = 320
         self.height = 240
@@ -78,7 +80,7 @@ class KimikoDesktopGhost:
             self.root,
             width=self.width,
             height=self.height,
-            bg="#101018",
+            bg=self.key_color,
             highlightthickness=0,
         )
         self.canvas.pack(fill="both", expand=True)
@@ -94,15 +96,29 @@ class KimikoDesktopGhost:
         self.root.after(1000, self._idle_tick)
 
     # ---------------- image loading & rendering ----------------
-    def _flatten_image_alpha(self, img):
-        """Flatten transparent PNGs onto an opaque background to avoid halo artifacts."""
+    def _prepare_binary_alpha_image(self, img):
+        """Prepare PNG for transparentcolor windows with crisp transparent background.
+
+        Converts semi-transparent edges to either fully transparent or fully opaque pixels
+        to avoid color-key halos while preserving transparent background.
+        """
         if Image is None:
             return img
 
         rgba = img.convert("RGBA")
-        matte = Image.new("RGBA", rgba.size, (16, 16, 24, 255))
-        merged = Image.alpha_composite(matte, rgba)
-        return merged.convert("RGB")
+        px = rgba.load()
+        width, height = rgba.size
+
+        key_r, key_g, key_b = 255, 0, 255
+        for y in range(height):
+            for x in range(width):
+                r, g, b, a = px[x, y]
+                if a < 170:
+                    px[x, y] = (key_r, key_g, key_b, 255)
+                else:
+                    px[x, y] = (r, g, b, 255)
+
+        return rgba
 
     def _fit_image(self, img):
         """Scale image to fit character area while keeping full character visible."""
@@ -124,7 +140,7 @@ class KimikoDesktopGhost:
             try:
                 pil_img = Image.open(path).convert("RGBA")
                 pil_img = self._fit_image(pil_img)
-                pil_img = self._flatten_image_alpha(pil_img)
+                pil_img = self._prepare_binary_alpha_image(pil_img)
                 return ImageTk.PhotoImage(pil_img)
             except Exception:
                 return None
@@ -197,9 +213,10 @@ class KimikoDesktopGhost:
         self.dock.withdraw()
         self.dock.overrideredirect(True)
         self.dock.attributes("-topmost", True)
-        self.dock.configure(bg="#101018")
+        self.dock.configure(bg=self.key_color)
+        self.dock.wm_attributes("-transparentcolor", self.key_color)
 
-        self.dock_canvas = tk.Canvas(self.dock, width=26, height=110, bg="#101018", highlightthickness=0)
+        self.dock_canvas = tk.Canvas(self.dock, width=26, height=110, bg=self.key_color, highlightthickness=0)
         self.dock_canvas.pack(fill="both", expand=True)
         self.dock_canvas.create_rectangle(3, 5, 24, 105, fill="#d9d4ff", outline="#8e84d2", width=2)
         self.dock_canvas.create_text(14, 54, text="◀", font=("Segoe UI", 11, "bold"), fill="#4a417e")
