@@ -33,8 +33,7 @@ class KimikoDesktopGhost:
         self.root.title("Kimiko")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#00ff00")
-        self.root.wm_attributes("-transparentcolor", "#00ff00")
+        self.root.configure(bg="#101018")
 
         self.width = 320
         self.height = 240
@@ -79,7 +78,7 @@ class KimikoDesktopGhost:
             self.root,
             width=self.width,
             height=self.height,
-            bg="#00ff00",
+            bg="#101018",
             highlightthickness=0,
         )
         self.canvas.pack(fill="both", expand=True)
@@ -95,43 +94,15 @@ class KimikoDesktopGhost:
         self.root.after(1000, self._idle_tick)
 
     # ---------------- image loading & rendering ----------------
-    def _prepare_image_for_colorkey_window(self, img):
-        """Normalize alpha for colorkey transparency windows.
-
-        Tk's transparentcolor behaves as color-key transparency (not full per-pixel alpha),
-        so semi-transparent edges can blend with the green key color and look like green halos.
-        We harden near-transparent pixels and clamp edge alpha to remove visible green fringes.
-        """
+    def _flatten_image_alpha(self, img):
+        """Flatten transparent PNGs onto an opaque background to avoid halo artifacts."""
         if Image is None:
             return img
 
         rgba = img.convert("RGBA")
-        px = rgba.load()
-        width, height = rgba.size
-
-        for y in range(height):
-            for x in range(width):
-                r, g, b, a = px[x, y]
-
-                # Remove extremely transparent pixels entirely.
-                if a <= 24:
-                    px[x, y] = (r, g, b, 0)
-                    continue
-
-                # Avoid half-transparent edge blending against green transparentcolor key.
-                if a < 220:
-                    # Edge color de-spill: neutralize green-heavy edge pixels first.
-                    if g > r and g > b:
-                        g = int((r + b) / 2)
-                    px[x, y] = (r, g, b, 0)
-                    continue
-
-                # Keep interior opaque, but de-spill any green tint.
-                if g > r * 1.1 and g > b * 1.1:
-                    g = int((r + b) / 2)
-                px[x, y] = (r, g, b, 255)
-
-        return rgba
+        matte = Image.new("RGBA", rgba.size, (16, 16, 24, 255))
+        merged = Image.alpha_composite(matte, rgba)
+        return merged.convert("RGB")
 
     def _fit_image(self, img):
         """Scale image to fit character area while keeping full character visible."""
@@ -151,9 +122,9 @@ class KimikoDesktopGhost:
     def _load_image_file(self, path: Path):
         if Image is not None and ImageTk is not None:
             try:
-                pil_img = Image.open(path)
-                pil_img = self._prepare_image_for_colorkey_window(pil_img)
+                pil_img = Image.open(path).convert("RGBA")
                 pil_img = self._fit_image(pil_img)
+                pil_img = self._flatten_image_alpha(pil_img)
                 return ImageTk.PhotoImage(pil_img)
             except Exception:
                 return None
@@ -226,10 +197,9 @@ class KimikoDesktopGhost:
         self.dock.withdraw()
         self.dock.overrideredirect(True)
         self.dock.attributes("-topmost", True)
-        self.dock.configure(bg="#00ff00")
-        self.dock.wm_attributes("-transparentcolor", "#00ff00")
+        self.dock.configure(bg="#101018")
 
-        self.dock_canvas = tk.Canvas(self.dock, width=26, height=110, bg="#00ff00", highlightthickness=0)
+        self.dock_canvas = tk.Canvas(self.dock, width=26, height=110, bg="#101018", highlightthickness=0)
         self.dock_canvas.pack(fill="both", expand=True)
         self.dock_canvas.create_rectangle(3, 5, 24, 105, fill="#d9d4ff", outline="#8e84d2", width=2)
         self.dock_canvas.create_text(14, 54, text="◀", font=("Segoe UI", 11, "bold"), fill="#4a417e")
